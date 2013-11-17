@@ -106,7 +106,7 @@ static zend_function_entry mongo_methods[] = {
 	PHP_ME(MongoClient, close, arginfo_no_parameters, ZEND_ACC_PUBLIC)
 	PHP_ME(MongoClient, killCursor, arginfo_killCursor, ZEND_ACC_PUBLIC|ZEND_ACC_STATIC)
 
-	{ NULL, NULL, NULL }
+	PHP_FE_END
 };
 
 /* {{{ php_mongoclient_free
@@ -475,11 +475,11 @@ void php_mongo_ctor(INTERNAL_FUNCTION_PARAMETERS, int bc)
 		) {
 			switch (zend_hash_get_current_key_ex(Z_ARRVAL_P(options), &opt_key, &opt_key_len, &num_key, 0, &pos)) {
 				case HASH_KEY_IS_STRING: {
-					int error = 0;
+					int error_code = 0;
 
-					error = mongo_store_option_wrapper(link->manager, link->servers, opt_key, opt_entry, (char **)&error_message);
+					error_code = mongo_store_option_wrapper(link->manager, link->servers, opt_key, opt_entry, (char **)&error_message);
 
-					switch (error) {
+					switch (error_code) {
 						case -1: /* Deprecated options */
 							if (strcasecmp(opt_key, "slaveOkay") == 0) {
 								php_error_docref(NULL TSRMLS_CC, MONGO_E_DEPRECATED, "The 'slaveOkay' option is deprecated. Please switch to read-preferences");
@@ -498,7 +498,7 @@ void php_mongo_ctor(INTERNAL_FUNCTION_PARAMETERS, int bc)
 						case 2: /* Unknown connection string option */
 						case 1: /* Empty option name or value */
 							/* Throw exception - error code is 20 + above value. They are defined in php_mongo.h */
-							zend_throw_exception(mongo_ce_ConnectionException, error_message, 20 + error TSRMLS_CC);
+							zend_throw_exception(mongo_ce_ConnectionException, error_message, 20 + error_code TSRMLS_CC);
 							free(error_message);
 							return;
 					}
@@ -664,7 +664,7 @@ static void stringify_server(mongo_server_def *server, smart_str *str)
    Returns comma seperated list of servers we try to use */
 PHP_METHOD(MongoClient, __toString)
 {
-	smart_str str = { 0 };
+	smart_str str = { NULL, 0, 0 };
 	mongoclient *link;
 	int i;
 
@@ -800,7 +800,7 @@ PHP_METHOD(MongoClient, selectCollection)
 {
 	char *db, *coll;
 	int db_len, coll_len;
-	zval *db_name, *coll_name, *temp_db;
+	zval *db_name, *temp_db, *collection;
 
 	if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "ss", &db, &db_len, &coll, &coll_len) == FAILURE) {
 		return;
@@ -814,12 +814,13 @@ PHP_METHOD(MongoClient, selectCollection)
 	zval_ptr_dtor(&db_name);
 	PHP_MONGO_CHECK_EXCEPTION1(&temp_db);
 
-	MAKE_STD_ZVAL(coll_name);
-	ZVAL_STRINGL(coll_name, coll, coll_len, 1);
+	collection = php_mongodb_selectcollection(temp_db, coll, coll_len TSRMLS_CC);
+	if (collection) {
+		/* Only copy the zval into return_value if it worked. If collection is
+		 * NULL here, an exception is set */
+		RETVAL_ZVAL(collection, 0, 1);
+	}
 
-	MONGO_METHOD1(MongoDB, selectCollection, return_value, temp_db, coll_name);
-
-	zval_ptr_dtor(&coll_name);
 	zval_ptr_dtor(&temp_db);
 }
 /* }}} */
@@ -910,7 +911,7 @@ PHP_METHOD(MongoClient, listDBs)
 	array_init(cmd);
 	add_assoc_long(cmd, "listDatabases", 1);
 
-	retval = php_mongodb_runcommand(db->link, &db->read_pref, Z_STRVAL_P(db->name), Z_STRLEN_P(db->name), cmd, NULL TSRMLS_CC);
+	retval = php_mongodb_runcommand(db->link, &db->read_pref, Z_STRVAL_P(db->name), Z_STRLEN_P(db->name), cmd, NULL, 0 TSRMLS_CC);
 
 	zval_ptr_dtor(&cmd);
 	zval_ptr_dtor(&zdb);
@@ -1019,6 +1020,10 @@ PHP_METHOD(MongoClient, getConnections)
 		add_assoc_long(version, "mini",  con->version.mini);
 		add_assoc_long(version, "build", con->version.build);
 		add_assoc_zval(server, "version", version);
+
+		/* Add [min|max]WireVersion */
+		add_assoc_long(connection, "min_wire_version", con->min_wire_version);
+		add_assoc_long(connection, "max_wire_version", con->max_wire_version);
 
 		/* Grab connection info */
 		add_assoc_long(connection, "last_ping", con->last_ping);

@@ -26,10 +26,12 @@
 #include "db.h"
 #include "mcon/manager.h"
 #include "mcon/io.h"
+#include "mcon/utils.h"
 #include "log_stream.h"
 
 extern zend_class_entry *mongo_ce_MongoClient, *mongo_ce_DB, *mongo_ce_Cursor;
 extern zend_class_entry *mongo_ce_Code, *mongo_ce_Exception, *mongo_ce_ResultException;
+extern zend_class_entry *mongo_ce_CursorException;
 
 extern int le_pconnection, le_connection;
 extern zend_object_handlers mongo_default_handlers;
@@ -42,7 +44,6 @@ static mongo_connection* get_server(mongo_collection *c, int connection_flags TS
 static int is_gle_op(zval *options, mongo_server_options *server_options TSRMLS_DC);
 static void do_gle_op(mongo_con_manager *manager, mongo_connection *connection, zval *cursor_z, buffer *buf, zval *return_value TSRMLS_DC);
 static zval* append_getlasterror(zval *coll, buffer *buf, zval *options, mongo_connection *connection TSRMLS_DC);
-static int php_mongo_trigger_error_on_command_failure(zval *document TSRMLS_DC);
 static char *to_index_string(zval *zkeys, int *key_len TSRMLS_DC);
 
 /* {{{ proto MongoCollection MongoCollection::__construct(MongoDB db, string name)
@@ -257,7 +258,7 @@ PHP_METHOD(MongoCollection, drop)
 	add_assoc_zval(cmd, "drop", c->name);
 	zval_add_ref(&c->name);
 
-	retval = php_mongodb_runcommand(c->link, &c->read_pref, Z_STRVAL_P(db->name), Z_STRLEN_P(db->name), cmd, NULL TSRMLS_CC);
+	retval = php_mongodb_runcommand(c->link, &c->read_pref, Z_STRVAL_P(db->name), Z_STRLEN_P(db->name), cmd, NULL, 0 TSRMLS_CC);
 
 	zval_ptr_dtor(&cmd);
 	RETURN_ZVAL(retval, 0, 1);
@@ -285,7 +286,7 @@ PHP_METHOD(MongoCollection, validate)
 	add_assoc_string(cmd, "validate", Z_STRVAL_P(c->name), 1);
 	add_assoc_bool(cmd, "full", scan_data);
 
-	retval = php_mongodb_runcommand(c->link, &c->read_pref, Z_STRVAL_P(db->name), Z_STRLEN_P(db->name), cmd, NULL TSRMLS_CC);
+	retval = php_mongodb_runcommand(c->link, &c->read_pref, Z_STRVAL_P(db->name), Z_STRLEN_P(db->name), cmd, NULL, 0 TSRMLS_CC);
 
 	zval_ptr_dtor(&cmd);
 	RETURN_ZVAL(retval, 0, 1);
@@ -486,7 +487,7 @@ static zval* append_getlasterror(zval *coll, buffer *buf, zval *options, mongo_c
 	 * db.c/MongoDB::command. The Cursor creation should be done through an
 	 * init method otherwise a connection have to be requested twice. */
 	mongo_manager_log(link->manager, MLOG_CON, MLOG_INFO, "forcing primary for getlasterror");
-	php_mongo_connection_force_primary(cursor);
+	php_mongo_cursor_force_primary(cursor);
 
 	cursor->limit = -1;
 	cursor->timeout = timeout;
@@ -527,10 +528,10 @@ static mongo_connection* get_server(mongo_collection *c, int connection_flags TS
 	/* TODO: Fix better error message */
 	if ((connection = mongo_get_read_write_connection(link->manager, link->servers, connection_flags, (char **) &error_message)) == NULL) {
 		if (error_message) {
-			mongo_cursor_throw(NULL, 16 TSRMLS_CC, "Couldn't get connection: %s", error_message);
+			mongo_cursor_throw(mongo_ce_CursorException, NULL, 16 TSRMLS_CC, "Couldn't get connection: %s", error_message);
 			free(error_message);
 		} else {
-			mongo_cursor_throw(NULL, 16 TSRMLS_CC, "Couldn't get connection");
+			mongo_cursor_throw(mongo_ce_CursorException, NULL, 16 TSRMLS_CC, "Couldn't get connection");
 		}
 		return 0;
 	}
@@ -562,6 +563,7 @@ static int send_message(zval *this_ptr, mongo_connection *connection, buffer *bu
 		zval *cursor = append_getlasterror(getThis(), buf, options, connection TSRMLS_CC);
 		if (cursor) {
 			do_gle_op(link->manager, connection, cursor, buf, return_value TSRMLS_CC);
+			zval_ptr_dtor(&cursor);
 			retval = -1;
 		} else {
 			retval = 0;
@@ -669,60 +671,46 @@ static void connection_deregister_wrapper(mongo_con_manager *manager, mongo_conn
 
 static void do_gle_op(mongo_con_manager *manager, mongo_connection *connection, zval *cursor_z, buffer *buf, zval *return_value TSRMLS_DC)
 {
-	zval *errmsg, **err;
-	mongo_cursor *cursor;
 	char *error_message;
+	mongo_cursor *cursor;
+	mongoclient *client;
 
 	cursor = (mongo_cursor*)zend_object_store_get_object(cursor_z TSRMLS_CC);
-
+	client = (mongoclient*)zend_object_store_get_object(cursor->zmongoclient TSRMLS_CC);
 	cursor->connection = connection;
 
-	if (-1 == manager->send(connection, NULL, buf->start, buf->pos - buf->start, (char **) &error_message)) {
+	if (-1 == manager->send(connection, &client->servers->options, buf->start, buf->pos - buf->start, (char **) &error_message)) {
 		mongo_manager_log(manager, MLOG_IO, MLOG_WARN, "do_gle_op: sending data failed, removing connection %s", connection->hash);
-		mongo_cursor_throw(connection, 16 TSRMLS_CC, "%s", error_message);
+		mongo_cursor_throw(mongo_ce_CursorException, connection, 16 TSRMLS_CC, "%s", error_message);
 		connection_deregister_wrapper(manager, connection TSRMLS_CC);
 
-		free(error_message);    
+		free(error_message);
 		cursor->connection = NULL;
-		zval_ptr_dtor(&cursor_z);
 		return;
 	}
 
 	/* get reply */
-	MAKE_STD_ZVAL(errmsg);
-	ZVAL_NULL(errmsg);
-
-	if (FAILURE == php_mongo_get_reply(cursor, errmsg TSRMLS_CC)) {
+	if (FAILURE == php_mongo_get_reply(cursor TSRMLS_CC)) {
 		/* php_mongo_get_reply() throws exceptions */
 		mongo_manager_connection_deregister(manager, connection);
 		cursor->connection = NULL;
-		zval_ptr_dtor(&cursor_z);
-		zval_ptr_dtor(&errmsg);
 		return;
 	}
-	zval_ptr_dtor(&errmsg);
 
 	cursor->started_iterating = 1;
 
 	MONGO_METHOD(MongoCursor, getNext, return_value, cursor_z);
 
+	/* MongoCursor::getNext() threw an exception */
 	if (EG(exception) || (Z_TYPE_P(return_value) == IS_BOOL && Z_BVAL_P(return_value) == 0)) {
 		cursor->connection = NULL;
-		zval_ptr_dtor(&cursor_z);
-		return;
-	} else if (zend_hash_find(Z_ARRVAL_P(return_value), "errmsg", strlen("errmsg") + 1, (void**)&err) == SUCCESS && Z_TYPE_PP(err) == IS_STRING) {
-		zval **code;
-		int status = zend_hash_find(Z_ARRVAL_P(return_value), "n", strlen("n") + 1, (void**)&code);
-
-		mongo_cursor_throw(cursor->connection, (status == SUCCESS ? Z_LVAL_PP(code) : 0) TSRMLS_CC, "%s", Z_STRVAL_PP(err));
-
-		cursor->connection = NULL;
-		zval_ptr_dtor(&cursor_z);
 		return;
 	}
 
+	/* Check if either the GLE command or the previous write operation failed */
+	php_mongo_trigger_error_on_gle(cursor->connection, return_value TSRMLS_CC);
+
 	cursor->connection = NULL;
-	zval_ptr_dtor(&cursor_z);
 	return;
 }
 
@@ -940,9 +928,11 @@ PHP_METHOD(MongoCollection, findAndModify)
 		zend_hash_merge(HASH_P(cmd), HASH_P(options), (void (*)(void*))zval_add_ref, &temp, sizeof(zval*), 1);
 	}
 
-	retval = php_mongodb_runcommand(c->link, &c->read_pref, Z_STRVAL_P(db->name), Z_STRLEN_P(db->name), cmd, NULL TSRMLS_CC);
+	retval = php_mongodb_runcommand(c->link, &c->read_pref, Z_STRVAL_P(db->name), Z_STRLEN_P(db->name), cmd, NULL, 0 TSRMLS_CC);
 
-	if (php_mongo_trigger_error_on_command_failure(retval TSRMLS_CC) == SUCCESS) {
+	/* TODO: If we can get the command's connection, we can use it when throwing
+	 * an exception on command failure instead of passing NULL. */
+	if (php_mongo_trigger_error_on_command_failure(NULL, retval TSRMLS_CC) == SUCCESS) {
 		if (zend_hash_find(Z_ARRVAL_P(retval), "value", strlen("value") + 1, (void **)&values) == SUCCESS) {
 			/* We may wind up with a NULL here if there simply aren't any results */
 			if (Z_TYPE_PP(values) == IS_ARRAY) {
@@ -1108,7 +1098,7 @@ PHP_METHOD(MongoCollection, remove)
    Create the $keys index if it does not already exist */
 PHP_METHOD(MongoCollection, ensureIndex)
 {
-	zval *keys, *options = 0, *db, *system_indexes, *collection, *data;
+	zval *keys, *options = 0, *db, *collection, *data;
 	mongo_collection *c;
 	zend_bool done_name = 0;
 
@@ -1139,12 +1129,8 @@ PHP_METHOD(MongoCollection, ensureIndex)
 	/* get the system.indexes collection */
 	db = c->parent;
 
-	MAKE_STD_ZVAL(system_indexes);
-	ZVAL_STRING(system_indexes, "system.indexes", 1);
-
-	MAKE_STD_ZVAL(collection);
-	MONGO_METHOD1(MongoDB, selectCollection, collection, db, system_indexes);
-	PHP_MONGO_CHECK_EXCEPTION3(&keys, &system_indexes, &collection);
+	collection = php_mongodb_selectcollection(db, "system.indexes", strlen("system.indexes") TSRMLS_CC);
+	PHP_MONGO_CHECK_EXCEPTION2(&keys, &collection);
 
 	/* set up data */
 	MAKE_STD_ZVAL(data);
@@ -1217,7 +1203,6 @@ PHP_METHOD(MongoCollection, ensureIndex)
 
 	zval_ptr_dtor(&options);
 	zval_ptr_dtor(&data);
-	zval_ptr_dtor(&system_indexes);
 	zval_ptr_dtor(&collection);
 	zval_ptr_dtor(&keys);
 }
@@ -1251,7 +1236,7 @@ PHP_METHOD(MongoCollection, deleteIndex)
 	zval_add_ref(&c->name);
 	add_assoc_string(cmd, "index", key_str, 1);
 
-	retval = php_mongodb_runcommand(c->link, &c->read_pref, Z_STRVAL_P(db->name), Z_STRLEN_P(db->name), cmd, NULL TSRMLS_CC);
+	retval = php_mongodb_runcommand(c->link, &c->read_pref, Z_STRVAL_P(db->name), Z_STRLEN_P(db->name), cmd, NULL, 0 TSRMLS_CC);
 
 	zval_ptr_dtor(&cmd);
 	efree(key_str);
@@ -1277,7 +1262,7 @@ PHP_METHOD(MongoCollection, deleteIndexes)
 	add_assoc_string(cmd, "deleteIndexes", Z_STRVAL_P(c->name), 1);
 	add_assoc_string(cmd, "index", "*", 1);
 
-	retval = php_mongodb_runcommand(c->link, &c->read_pref, Z_STRVAL_P(db->name), Z_STRLEN_P(db->name), cmd, NULL TSRMLS_CC);
+	retval = php_mongodb_runcommand(c->link, &c->read_pref, Z_STRVAL_P(db->name), Z_STRLEN_P(db->name), cmd, NULL, 0 TSRMLS_CC);
 
 	zval_ptr_dtor(&cmd);
 	RETURN_ZVAL(retval, 0, 1);
@@ -1288,16 +1273,11 @@ PHP_METHOD(MongoCollection, deleteIndexes)
    Get all indexes for this collection */
 PHP_METHOD(MongoCollection, getIndexInfo)
 {
-	zval *collection, *i_str, *query, *cursor, *next;
+	zval *collection, *query, *cursor, *next;
 	mongo_collection *c;
 	PHP_MONGO_GET_COLLECTION(getThis());
 
-	MAKE_STD_ZVAL(collection);
-
-	MAKE_STD_ZVAL(i_str);
-	ZVAL_STRING(i_str, "system.indexes", 1);
-	MONGO_METHOD1(MongoDB, selectCollection, collection, c->parent, i_str);
-	zval_ptr_dtor(&i_str);
+	collection = php_mongodb_selectcollection(c->parent, "system.indexes", strlen("system.indexes") TSRMLS_CC);
 	PHP_MONGO_CHECK_EXCEPTION1(&collection);
 
 	MAKE_STD_ZVAL(query);
@@ -1361,7 +1341,7 @@ PHP_METHOD(MongoCollection, count)
 		add_assoc_long(cmd, "skip", skip);
 	}
 
-	response = php_mongodb_runcommand(c->link, &c->read_pref, Z_STRVAL_P(db->name), Z_STRLEN_P(db->name), cmd, NULL TSRMLS_CC);
+	response = php_mongodb_runcommand(c->link, &c->read_pref, Z_STRVAL_P(db->name), Z_STRLEN_P(db->name), cmd, NULL, 0 TSRMLS_CC);
 
 	zval_ptr_dtor(&cmd);
 
@@ -1491,7 +1471,7 @@ static void replace_dots(char *key, int key_len)
 
 static char *to_index_string(zval *zkeys, int *key_len TSRMLS_DC)
 {
-	smart_str str = { NULL };
+	smart_str str = { NULL, 0, 0 };
 
 	switch (Z_TYPE_P(zkeys)) {
 		case IS_ARRAY:
@@ -1500,7 +1480,7 @@ static char *to_index_string(zval *zkeys, int *key_len TSRMLS_DC)
 			HashPosition pointer;
 			zval **data;
 			char *key;
-			uint key_len, first = 1, key_type;
+			uint index_key_len, first = 1, key_type;
 			ulong index;
 
 			for (
@@ -1513,11 +1493,11 @@ static char *to_index_string(zval *zkeys, int *key_len TSRMLS_DC)
 				}
 				first = 0;
 
-				key_type = zend_hash_get_current_key_ex(hindex, &key, &key_len, &index, NO_DUP, &pointer);
+				key_type = zend_hash_get_current_key_ex(hindex, &key, &index_key_len, &index, NO_DUP, &pointer);
 
 				switch (key_type) {
 					case HASH_KEY_IS_STRING:
-						smart_str_appendl(&str, key, key_len - 1);
+						smart_str_appendl(&str, key, index_key_len - 1);
 						break;
 
 					case HASH_KEY_IS_LONG:
@@ -1641,7 +1621,7 @@ PHP_METHOD(MongoCollection, aggregate)
 	}
 	efree(argv);
 
-	retval = php_mongodb_runcommand(c->link, &c->read_pref, Z_STRVAL_P(db->name), Z_STRLEN_P(db->name), cmd, NULL TSRMLS_CC);
+	retval = php_mongodb_runcommand(c->link, &c->read_pref, Z_STRVAL_P(db->name), Z_STRLEN_P(db->name), cmd, NULL, 0 TSRMLS_CC);
 
 	zval_ptr_dtor(&cmd);
 
@@ -1682,7 +1662,7 @@ PHP_METHOD(MongoCollection, distinct)
 		zval_add_ref(&query);
 	}
 
-	tmp = php_mongodb_runcommand(c->link, &c->read_pref, Z_STRVAL_P(db->name), Z_STRLEN_P(db->name), cmd, NULL TSRMLS_CC);
+	tmp = php_mongodb_runcommand(c->link, &c->read_pref, Z_STRVAL_P(db->name), Z_STRLEN_P(db->name), cmd, NULL, 0 TSRMLS_CC);
 
 	if (zend_hash_find(Z_ARRVAL_P(tmp), "values", strlen("values") + 1, (void **)&values) == SUCCESS) {
 #ifdef array_init_size
@@ -1777,7 +1757,7 @@ PHP_METHOD(MongoCollection, group)
 	array_init(cmd);
 	add_assoc_zval(cmd, "group", group);
 
-	retval = php_mongodb_runcommand(c->link, &c->read_pref, Z_STRVAL_P(db->name), Z_STRLEN_P(db->name), cmd, NULL TSRMLS_CC);
+	retval = php_mongodb_runcommand(c->link, &c->read_pref, Z_STRVAL_P(db->name), Z_STRLEN_P(db->name), cmd, NULL, 0 TSRMLS_CC);
 
 	zval_ptr_dtor(&cmd);
 	zval_ptr_dtor(&reduce);
@@ -1795,9 +1775,9 @@ PHP_METHOD(MongoCollection, __get)
 	/* This is a little trickier than the getters in Mongo and MongoDB... we
 	 * need to combine the current collection name with the parameter passed
 	 * in, get the parent db, then select the new collection from it. */
-	zval *full_name;
-	char *full_name_s, *name;
-	int name_len;
+	zval *collection;
+	char *full_name, *name;
+	int full_name_len, name_len;
 	mongo_collection *c;
 	PHP_MONGO_GET_COLLECTION(getThis());
 
@@ -1812,14 +1792,16 @@ PHP_METHOD(MongoCollection, __get)
 		RETURN_ZVAL(c->parent, 1, 0);
 	}
 
-	spprintf(&full_name_s, 0, "%s.%s", Z_STRVAL_P(c->name), name);
-	MAKE_STD_ZVAL(full_name);
-	ZVAL_STRING(full_name, full_name_s, 0);
+	full_name_len = spprintf(&full_name, 0, "%s.%s", Z_STRVAL_P(c->name), name);
 
 	/* select this collection */
-	MONGO_METHOD1(MongoDB, selectCollection, return_value, c->parent, full_name);
-
-	zval_ptr_dtor(&full_name);
+	collection = php_mongodb_selectcollection(c->parent, full_name, full_name_len TSRMLS_CC);
+	if (collection) {
+		/* Only copy the zval into return_value if it worked. If collection is
+		 * NULL here, an exception is set */
+		RETVAL_ZVAL(collection, 0, 1);
+	}
+	efree(full_name);
 }
 /* }}} */
 
@@ -1972,7 +1954,7 @@ static zend_function_entry MongoCollection_methods[] = {
 	PHP_ME(MongoCollection, group, arginfo_group, ZEND_ACC_PUBLIC)
 	PHP_ME(MongoCollection, distinct, arginfo_distinct, ZEND_ACC_PUBLIC)
 	PHP_ME(MongoCollection, aggregate, arginfo_aggregate, ZEND_ACC_PUBLIC)
-	{NULL, NULL, NULL}
+	PHP_FE_END
 };
 
 static void php_mongo_collection_free(void *object TSRMLS_DC)
@@ -1997,45 +1979,6 @@ static void php_mongo_collection_free(void *object TSRMLS_DC)
 		efree(c);
 	}
 }
-
-static int php_mongo_trigger_error_on_command_failure(zval *document TSRMLS_DC)
-{
-	zval **tmpvalue;
-
-	if (Z_TYPE_P(document) != IS_ARRAY) {
-		zend_throw_exception(mongo_ce_ResultException, strdup("Unknown error executing command (empty document returned)"), 0 TSRMLS_CC);
-		return FAILURE;
-	}
-
-	if (zend_hash_find(Z_ARRVAL_P(document), "ok", strlen("ok") + 1, (void **) &tmpvalue) == SUCCESS) {
-		if ((Z_TYPE_PP(tmpvalue) == IS_LONG && Z_LVAL_PP(tmpvalue) < 1) || (Z_TYPE_PP(tmpvalue) == IS_DOUBLE && Z_DVAL_PP(tmpvalue) < 1)) {
-			zval **tmp, *exception;
-			char *message;
-			long code;
-
-			if (zend_hash_find(Z_ARRVAL_P(document), "errmsg", strlen("errmsg") + 1, (void **) &tmp) == SUCCESS) {
-				convert_to_string_ex(tmp);
-				message = Z_STRVAL_PP(tmp);
-			} else {
-				message = strdup("Unknown error executing command");
-			}
-
-			if (zend_hash_find(Z_ARRVAL_P(document), "code", strlen("code") + 1, (void **) &tmp) == SUCCESS) {
-				convert_to_long_ex(tmp);
-				code = Z_LVAL_PP(tmp);
-			} else {
-				code = 0;
-			}
-
-			exception = zend_throw_exception(mongo_ce_ResultException, message, code TSRMLS_CC);
-			zend_update_property(mongo_ce_Exception, exception, "document", strlen("document"), document TSRMLS_CC);
-
-			return FAILURE;
-		}
-	}
-	return SUCCESS;
-}
-
 
 /* {{{ php_mongo_collection_new
  */

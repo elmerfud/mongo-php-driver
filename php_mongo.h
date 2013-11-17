@@ -27,6 +27,17 @@
 # endif
 #endif
 
+#if defined(_MSC_VER)
+# define strtoll(s, f, b) _atoi64(s)
+#elif !defined(HAVE_STRTOLL)
+# if defined(HAVE_ATOLL)
+#  define strtoll(s, f, b) atoll(s)
+# else
+#  define strtoll(s, f, b) strtol(s, f, b)
+# endif
+#endif
+
+
 #include "mcon/types.h"
 #include "mcon/read_preference.h"
 
@@ -160,6 +171,7 @@ typedef __int64 int64_t;
 # define MONGO_E_DEPRECATED E_DEPRECATED
 #else
 # define MONGO_E_DEPRECATED E_STRICT
+# define PHP_FE_END         { NULL, NULL, NULL, 0, 0 }
 #endif
 
 #define MUST_BE_ARRAY_OR_OBJECT(num, arg) do { \
@@ -392,31 +404,31 @@ typedef struct {
 
 #define PHP_MONGO_CHECK_EXCEPTION1(arg1) \
 	if (EG(exception)) { \
-		zval_ptr_dtor(arg1); \
+		if (*arg1) { zval_ptr_dtor(arg1); } \
 		return; \
 	}
 
 #define PHP_MONGO_CHECK_EXCEPTION2(arg1, arg2) \
 	if (EG(exception)) { \
-		zval_ptr_dtor(arg1); \
-		zval_ptr_dtor(arg2); \
+		if (*arg1) { zval_ptr_dtor(arg1); } \
+		if (*arg2) { zval_ptr_dtor(arg2); } \
 	return; \
 	}
 
 #define PHP_MONGO_CHECK_EXCEPTION3(arg1, arg2, arg3) \
 	if (EG(exception)) { \
-		zval_ptr_dtor(arg1); \
-		zval_ptr_dtor(arg2); \
-		zval_ptr_dtor(arg3); \
+		if (*arg1) { zval_ptr_dtor(arg1); } \
+		if (*arg2) { zval_ptr_dtor(arg2); } \
+		if (*arg3) { zval_ptr_dtor(arg3); } \
 		return; \
 	}
 
 #define PHP_MONGO_CHECK_EXCEPTION4(arg1, arg2, arg3, arg4) \
 	if (EG(exception)) { \
-		zval_ptr_dtor(arg1); \
-		zval_ptr_dtor(arg2); \
-		zval_ptr_dtor(arg3); \
-		zval_ptr_dtor(arg4); \
+		if (*arg1) { zval_ptr_dtor(arg1); } \
+		if (*arg2) { zval_ptr_dtor(arg2); } \
+		if (*arg3) { zval_ptr_dtor(arg3); } \
+		if (*arg4) { zval_ptr_dtor(arg4); } \
 		return; \
 	}
 
@@ -479,8 +491,11 @@ typedef struct {
 
 	mongo_read_preference read_pref;
 
-	int force_primary; /* If set to 1 then the connection selection will request a WRITE (primary) connection */
 	int dead;
+
+	/* Options that deal with changes to what the cursor documents return. For
+	 * example forcing longs to be returned as objects */
+	int cursor_options;
 } mongo_cursor;
 
 /* Unfortunately, cursors can be freed before or after link is destroyed, so we
@@ -591,6 +606,8 @@ void mongo_init_MongoInt64(TSRMLS_D);
 zval *php_mongo_make_tagsets(mongo_read_preference *rp);
 void php_mongo_add_tagsets(zval *return_value, mongo_read_preference *rp);
 int php_mongo_set_readpreference(mongo_read_preference *rp, char *read_preference, HashTable *tags TSRMLS_DC);
+int php_mongo_trigger_error_on_command_failure(mongo_connection *connection, zval *document TSRMLS_DC);
+int php_mongo_trigger_error_on_gle(mongo_connection *connection, zval *document TSRMLS_DC);
 
 ZEND_BEGIN_MODULE_GLOBALS(mongo)
 	/* php.ini options */
@@ -745,6 +762,11 @@ extern zend_module_entry mongo_module_entry;
  * 19: Could not find array key
  * 20: Chunk larger then chunksize
  * 21: Unexpected chunk format
+ *
+ * MongoResultException:
+ * 1: Unknown error executing command (empty document returned)
+ * 2: Command could not be executed for some reason (exception message tells why)
+ * 1000+: MongoDB server codes
  */
 
 /*

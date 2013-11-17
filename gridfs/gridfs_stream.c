@@ -273,7 +273,7 @@ static size_t gridfs_read(php_stream *stream, char *buf, size_t count TSRMLS_DC)
 		if (gridfs_read_chunk(self, chunk_id + 1 TSRMLS_CC) == FAILURE) {
 			return -1;
 		}
-		tmp_bytes = MIN(count-size, self->buffer_size);
+		tmp_bytes = MIN(count - size, self->buffer_size);
 		memcpy(buf+size, self->buffer, tmp_bytes);
 		size += tmp_bytes;
 	}

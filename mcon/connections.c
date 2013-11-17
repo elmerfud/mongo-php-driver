@@ -259,10 +259,10 @@ mongo_connection *mongo_connection_create(mongo_con_manager *manager, char *hash
 	tmp->version.minor = 8;
 	tmp->version.mini  = 0;
 	tmp->version.build = 0;
-	/* MongoDB pre-1.8; Spec says default to 4 MB */
-	tmp->max_bson_size = 4194304;
-	/* MongoDB pre-2.4; Spec says default to 2 * the maxBsonSize */
-	tmp->max_message_size = 2 * tmp->max_bson_size;
+	tmp->max_bson_size = MONGO_CONNECTION_DEFAULT_MAX_BSON_SIZE;
+	tmp->max_message_size = MONGO_CONNECTION_DEFAULT_MAX_MESSAGE_SIZE;
+	tmp->min_wire_version = MONGO_CONNECTION_DEFAULT_MIN_WIRE_VERSION;
+	tmp->max_wire_version = MONGO_CONNECTION_DEFAULT_MAX_WIRE_VERSION;
 
 	/* Store hash */
 	tmp->hash = strdup(hash);
@@ -375,7 +375,7 @@ static int mongo_connect_send_packet(mongo_con_manager *manager, mongo_connectio
 	mongo_manager_log(manager, MLOG_CON, MLOG_FINE, "send_packet: data_size: %d", data_size);
 
 	/* Check size limits */
-	if (con->max_bson_size && data_size > con->max_bson_size) {
+	if (con->max_bson_size && data_size > (uint32_t)con->max_bson_size) {
 		*error_message = malloc(256);
 		snprintf(*error_message, 256, "send_package: data corruption: the returned size of the reply (%d) is larger than the maximum allowed size (%d)", data_size, con->max_bson_size);
 		return 0;
@@ -465,12 +465,14 @@ int mongo_connection_ping(mongo_con_manager *manager, mongo_connection *con, mon
  * 2: when is master wasn't run due to the time-out limit
  * 3: when it all worked, but we need to remove the seed host (due to its name
  *    not being what the server thought it is) - in that case, the server in
- *    the last argument is changed */
+ *    the last argument is changed
+ * 4: when the call worked, but wasn't within our supported wire version range */
 int mongo_connection_ismaster(mongo_con_manager *manager, mongo_connection *con, mongo_server_options *options, char **repl_set_name, int *nr_hosts, char ***found_hosts, char **error_message, mongo_server_def *server)
 {
 	mcon_str      *packet;
 	char          *data_buffer;
 	int32_t        max_bson_size = 0, max_message_size = 0;
+	int32_t        min_wire_version = 0, max_wire_version = 0;
 	char          *set = NULL;      /* For replicaset in return */
 	char          *hosts, *passives = NULL, *ptr, *string;
 	char          *msg; /* If set and its value is "isdbgrid", it signals we connected to a mongos */
@@ -495,6 +497,27 @@ int mongo_connection_ismaster(mongo_con_manager *manager, mongo_connection *con,
 
 	/* Find data fields */
 	ptr = data_buffer + sizeof(int32_t); /* Skip the length */
+
+	/* Find [min|max]WireVersion */
+	if (bson_find_field_as_int32(ptr, "minWireVersion", &min_wire_version)) {
+		mongo_manager_log(manager, MLOG_CON, MLOG_FINE, "ismaster: setting minWireVersion to %d", min_wire_version);
+		con->min_wire_version = min_wire_version;
+	} else {
+		mongo_manager_log(manager, MLOG_CON, MLOG_FINE, "ismaster: can't find minWireVersion, defaulting to %d", con->min_wire_version);
+	}
+
+	if (bson_find_field_as_int32(ptr, "maxWireVersion", &max_wire_version)) {
+		mongo_manager_log(manager, MLOG_CON, MLOG_FINE, "ismaster: setting maxWireVersion to %d", max_wire_version);
+		con->max_wire_version = max_wire_version;
+	} else {
+		mongo_manager_log(manager, MLOG_CON, MLOG_FINE, "ismaster: can't find maxWireVersion, defaulting to %d", con->max_wire_version);
+	}
+
+	if (!manager->supports_wire_version(con->min_wire_version, con->max_wire_version, error_message)) {
+		/* Error message set by supports_wire_version */
+		free(data_buffer);
+		return 4;
+	}
 
 	/* Find max bson size */
 	if (bson_find_field_as_int32(ptr, "maxBsonObjectSize", &max_bson_size)) {
@@ -667,14 +690,6 @@ done:
 	return retval;
 }
 
-/* Sends an ismaster command to the server to find server flags
- *
- * Returns 1 when it worked, and 0 when an error was encountered. */
-int mongo_connection_get_server_flags(mongo_con_manager *manager, mongo_connection *con, mongo_server_options *options, char **error_message)
-{
-	return mongo_connection_ismaster(manager, con, options, NULL, NULL, NULL, error_message, NULL) > 0 ? 1 : 0;
-}
-
 /* Sends an buildInfo command to the server to find server version
  *
  * Returns 1 when it worked, and 0 when an error was encountered. */
@@ -697,7 +712,7 @@ int mongo_connection_get_server_version(mongo_con_manager *manager, mongo_connec
 
 	/* Find read preferences tags */
 	if (bson_find_field_as_array(ptr, "versionArray", (char**) &version_array)) {
-		char *it, *name;
+		char *it;
 
 		it = version_array;
 

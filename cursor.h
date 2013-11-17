@@ -19,7 +19,7 @@
 void php_mongo_cursor_free(void *object TSRMLS_DC);
 
 /* Tries to read the reply from the database */
-int php_mongo_get_reply(mongo_cursor *cursor, zval *errmsg TSRMLS_DC);
+int php_mongo_get_reply(mongo_cursor *cursor TSRMLS_DC);
 
 /* Queries the database. Returns SUCCESS or FAILURE. */
 int mongo_cursor__do_query(zval *this_ptr, zval *return_value TSRMLS_DC);
@@ -44,6 +44,13 @@ void php_mongo_kill_cursor(mongo_connection *con, int64_t cursor_id TSRMLS_DC);
 
 /* Set Cursor limit */
 void php_mongo_cursor_set_limit(mongo_cursor *cursor, long limit);
+/* Forces the bson to zval conversion to use an object for a long */
+void php_mongo_cursor_force_long_as_object(mongo_cursor *cursor);
+/* Flags the cursor as a command cursor */
+void php_mongo_cursor_force_command_cursor(mongo_cursor *cursor);
+/* Switch to primary connection */
+void php_mongo_cursor_force_primary(mongo_cursor *cursor);
+
 /* Set a Cursor Option */
 int php_mongo_cursor_add_option(mongo_cursor *cursor, char *key, zval *value TSRMLS_DC);
 
@@ -96,7 +103,7 @@ PHP_METHOD(MongoCursorException, getHost);
 /* Throw a MongoCursorException with the given code and message.  Uses the
  * server to fill in information about the connection that cause the exception.
  * Does nothing if an exception has already been thrown. */
-zval* mongo_cursor_throw(mongo_connection *connection, int code TSRMLS_DC, char *format, ...);
+zval* mongo_cursor_throw(zend_class_entry *exception_ce, mongo_connection *connection, int code TSRMLS_DC, char *format, ...);
 
 /* The cursor_list
  *

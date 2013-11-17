@@ -1,5 +1,5 @@
 /**
- *  Copyright 2009-2013 10gen, Inc.
+ *  Copyright 2013 MongoDB, Inc.
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -13,13 +13,24 @@
  *  See the License for the specific language governing permissions and
  *  limitations under the License.
  */
-#ifndef __RESULT_EXCEPTION_H__
-#define __RESULT_EXCEPTION_H__
 
-void mongo_init_MongoResultException(TSRMLS_D);
+#ifndef __API_WIRE_VERSION_H__
+#define __API_WIRE_VERSION_H__
 
-PHP_METHOD(MongoResultException, getDocument);
-PHP_METHOD(MongoResultException, getHost);
+/*
+ * Known wire versions:
+ * 0: All features before 2.5.0
+ * 1: Aggregate can return cursors
+ * 2: Write Commands API
+ *
+ * MongoDB 2.6.0 will return 0, 2
+ */
+
+/* Wire version this release of the driver supports */
+#define PHP_MONGO_API_MIN_WIRE_VERSION 0
+#define PHP_MONGO_API_MAX_WIRE_VERSION 2
+
+int php_mongo_api_supports_wire_version(int min_wire_version, int max_wire_version, char **error_message);
 
 #endif
 
