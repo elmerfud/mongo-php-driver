@@ -15,6 +15,7 @@
  */
 #include <php.h>
 #include <zend_exceptions.h>
+#include <inttypes.h>
 
 #include "../php_mongo.h"
 #include "../collection.h"
@@ -299,7 +300,7 @@ static int64_t copy_file(void *to, char *from, int64_t len)
 	int64_t written = fwrite(from, 1, len, (FILE*)to);
 
 	if (written != len) {
-		zend_error(E_WARNING, "Incorrect byte count. Expected: %d, got %d", len, written);
+		zend_error(E_WARNING, "Incorrect byte count. Expected: %" PRId64 ", got %" PRId64, len, written);
 	}
 
 	return written;

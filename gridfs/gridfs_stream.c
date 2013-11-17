@@ -31,6 +31,8 @@ typedef __int64 int64_t;
 
 #include <zend_exceptions.h>
 
+#include <inttypes.h>
+
 #include "../php_mongo.h"
 #include "gridfs.h"
 #include "gridfs_stream.h"
@@ -62,7 +64,7 @@ typedef struct _gridfs_stream_data {
 	int64_t size;
 
 	/* chunk size */
-	int64_t chunkSize;
+	int chunkSize;
 	int64_t totalChunks;
 
 	/* which chunk is loaded? */
@@ -130,7 +132,7 @@ php_stream_ops gridfs_stream_ops = {
 #define ASSERT_SIZE(size) \
 	if (size > self->chunkSize) { \
 		char * err; \
-		spprintf(&err, 0, "chunk %d has wrong size (%d) when the max is %d", chunk_id, size, self->chunkSize); \
+		spprintf(&err, 0, "chunk %" PRId64 " has wrong size (%d) when the max is %d", chunk_id, size, self->chunkSize); \
 		zend_throw_exception(mongo_ce_GridFSException, err, 20 TSRMLS_CC); \
 		zval_ptr_dtor(&chunk); \
 		return FAILURE; \
